@@ -1,0 +1,56 @@
+[
+  { "id": "module", "implicit": false,
+    "text": "Новый модуль lib/webSearch.js с функцией searchWeb(query,{num=5}): Serper POST https://google.serper.dev/search, заголовок X-API-KEY из env SERPER_API_KEY, тело {q,num}" },
+
+  { "id": "normalize", "implicit": false,
+    "text": "searchWeb возвращает нормализованный массив [{title,link,snippet,position}] из поля organic ответа Serper" },
+
+  { "id": "errors", "implicit": false,
+    "text": "Обработка ошибок searchWeb: нет ключа → понятная ошибка; таймаут 5с → пустой результат + лог; не-200 → лог + пустой результат; чат из-за поиска не падает" },
+
+  { "id": "hook", "implicit": false,
+    "text": "Комментарий // POST-PROCESSING HOOK в точке, где результаты Serper готовы, но ещё не отданы дальше (место под фильтры/реранк/дедуп/кэш, без реализации)" },
+
+  { "id": "toggle-global", "implicit": false,
+    "text": "Глобальный тумблер поиска в плейн-ветке /api/agent/ask через env WEB_SEARCH_ENABLED" },
+
+  { "id": "toggle-per-scope", "implicit": false,
+    "text": "Переопределение тумблера на юзера/чат через уже существующий паттерн тумблеров (не плодя новый механизм)" },
+
+  { "id": "context-inject", "implicit": false,
+    "text": "При включённом поиске: перед ответом модели дёрнуть searchWeb по запросу юзера и подмешать результаты (title+snippet+link) в контекст модели справочным блоком; при выключенном — прежнее поведение" },
+
+  { "id": "usage", "implicit": false,
+    "text": "Каждый вызов Serper учитывается в usage через существующий механизм usageLimits/usage-таблицу, отдельной статьёй расхода" },
+
+  { "id": "ratelimit", "implicit": false,
+    "text": "Rate limit на поиск per user (N/мин, разумный дефолт, вынесен в env), проверка ДО вызова Serper" },
+
+  { "id": "pg-invariants", "implicit": false, "constraint": true,
+    "text": "Соблюдены инварианты Postgres: await на каждый db.*, camelCase-колонки в кавычках, плейсхолдеры $1, BIGINT для времени" },
+
+  { "id": "no-stream-conflict", "implicit": false, "constraint": true,
+    "text": "Не сломан и не в конфликте стриминг плейн-чата (этап H) на том же пути ответа" },
+
+  { "id": "no-agent-tasks", "implicit": false, "constraint": true,
+    "text": "Стейт-машина agent_tasks не тронута" },
+
+  { "id": "no-project-context", "implicit": true,
+    "text": "Веб-результаты подмешиваются в контекст и в плейн-чате БЕЗ проекта, а не только в чатах, привязанных к проекту (иначе фича не работает для основного случая — чата без репо-задачи)" },
+
+  { "id": "native-fetch", "implicit": true, "constraint": true,
+    "text": "Только нативный fetch, без добавления новых зависимостей (в т.ч. node-fetch)" },
+
+  { "id": "env-doc", "implicit": true,
+    "text": "Новые env (SERPER_API_KEY, WEB_SEARCH_ENABLED, лимит частоты) задокументированы там, где в репо ведётся список env" },
+
+  { "id": "chats-schema", "implicit": true,
+    "text": "Per-chat тумблер требует изменения схемы chats (колонка webSearchEnabled) и способа его установки — без этого переопределение на чат нереализуемо" },
+
+  { "id": "usage-not-token-limit", "implicit": true,
+    "text": "Расход поиска не засчитывается в модельный токен-лимит: отдельная статья с нулевыми токенами (иначе поиск съедал бы лимит модели)" },
+
+  { "id": "ratelimit-graceful", "implicit": true,
+    "text": "Превышение rate limit обрабатывается кодом: Serper не вызывается, пользователю даётся понятный ответ (не молчаливый пустой результат и не заглушка-комментарий)" }
+]
+
