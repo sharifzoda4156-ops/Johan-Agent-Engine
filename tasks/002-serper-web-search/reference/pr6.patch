@@ -1,0 +1,550 @@
+diff --git a/db.js b/db.js
+index 299318e..9af1d2b 100644
+--- a/db.js
++++ b/db.js
+@@ -495,6 +495,18 @@ module.exports = {
+     return id;
+   },
+ 
++  /** Число обращений данного kind у юзера с момента sinceTs — для rate-limit
++   * веб-поиска (окно 60с). Та же usage-таблица, что и модельный расход. */
++  async countUsageSince(userId, kind, sinceTs) {
++    requireUserId(userId);
++    const { rows } = await query(
++      `SELECT COUNT(*)::int AS n
++       FROM usage WHERE "userId" = $1 AND kind = $2 AND ts >= $3`,
++      [userId, kind, sinceTs],
++    );
++    return rows[0] ? Number(rows[0].n) : 0;
++  },
++
+   /** Токены одной агентской задачи (план + подпункты + финализация) — бюджет задачи. */
+   async getTaskTokenUsage(taskId) {
+     const { rows } = await query(
+@@ -1368,6 +1380,20 @@ module.exports = {
+     return rows[0] || null;
+   },
+ 
++  /** Per-chat тумблер веб-поиска. enabled: true|false|null(наследовать глобальный).
++   * Только владелец чата. Возвращает обновлённую строку или null (чужой/нет чата). */
++  async setChatWebSearch(chatId, userId, enabled) {
++    requireUserId(userId);
++    const val = enabled === null || enabled === undefined ? null : enabled ? 1 : 0;
++    const { rows } = await query(
++      `UPDATE chats SET "webSearchEnabled" = $1, "updatedAt" = $2
++       WHERE id = $3 AND "userId" = $4 AND deleted = 0
++       RETURNING *`,
++      [val, Date.now(), chatId, userId],
++    );
++    return rows[0] || null;
++  },
++
+   /**
+    * Владелец чата без проверки прав вызывающего — для внутренних (backend-only)
+    * помощников, у которых нет req.userId под рукой, но которым принимающий
+diff --git a/ecosystem.config.example.js b/ecosystem.config.example.js
+index 2638e7e..a9aecb1 100644
+--- a/ecosystem.config.example.js
++++ b/ecosystem.config.example.js
+@@ -28,6 +28,17 @@ module.exports = {
+         // Без него сервер не стартует. Пароль админки нигде не хранится в конфиге —
+         // задаётся из приложения при первом входе в /admin.
+         SERVER_CONFIG_KEY: "<задать на VPS, не коммитить>",
++        // Слой 3 — веб-поиск в плейн-чате через Serper (lib/webSearch.js):
++        //   SERPER_API_KEY          — ключ google.serper.dev. Секрет: только .env на VPS,
++        //                             server_config его отклоняет (lib/serverConfig.js).
++        //   WEB_SEARCH_ENABLED      — глобальный тумблер: "1" вкл, иначе выкл.
++        //                             Переопределяется на чат: PATCH /api/chats/:id/web-search.
++        //                             Глобус композера (OpenRouter ":online") работает как
++        //                             раньше; если Serper дал результаты, ":online" не включается.
++        //   WEB_SEARCH_RATE_PER_MIN — лимит поисков per user в минуту (дефолт 10).
++        SERPER_API_KEY: "<задать на VPS, не коммитить>",
++        WEB_SEARCH_ENABLED: "0",
++        WEB_SEARCH_RATE_PER_MIN: 10,
+         // Task Understanding, кусок 2 (планировщик задач, lib/taskPlanner.js).
+         // OPENROUTER_API_KEY — ключ OpenRouter для вызова модели-планировщика
+         // (тот же тракт, что проверен в tools/plan-bench). Без него планирование
+diff --git a/lib/pgSchema.js b/lib/pgSchema.js
+index 805f7b2..1d9a4c8 100644
+--- a/lib/pgSchema.js
++++ b/lib/pgSchema.js
+@@ -420,6 +420,11 @@ ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS "progressEvents" TEXT;
+ ALTER TABLE chats ADD COLUMN IF NOT EXISTS "repoFullName" TEXT;
+ ALTER TABLE projects ADD COLUMN IF NOT EXISTS "repoFullName" TEXT;
+ 
++-- Слой 3 (веб-поиск): per-chat переопределение тумблера поиска. NULL —
++-- наследует глобальный env WEB_SEARCH_ENABLED; 1 — вкл; 0 — выкл. Отдельного
++-- механизма тумблеров не заводим — колонка на существующей таблице chats.
++ALTER TABLE chats ADD COLUMN IF NOT EXISTS "webSearchEnabled" INTEGER;
++
+ -- Прод-URL проекта: раньше жил только локально на мобиле (ProjectProfile.prodUrl)
+ -- и терялся на другом устройстве. Синкается через /api/projects/push|pull.
+ ALTER TABLE projects ADD COLUMN IF NOT EXISTS "prodUrl" TEXT;
+diff --git a/lib/webSearch.js b/lib/webSearch.js
+new file mode 100644
+index 0000000..d16af53
+--- /dev/null
++++ b/lib/webSearch.js
+@@ -0,0 +1,184 @@
++// ─────────────────────────────────────────────────────────────────────────────
++// webSearch — веб-поиск для плейн-чата через Serper (google-обёртка). Слой 3.
++//
++// Две части:
++//   1) searchWeb(query, {num})     — ЧИСТЫЙ вызов Serper (сигнатура из ТЗ).
++//   2) runChatWebSearch({...})      — оркестратор для чата: rate-limit ДО вызова
++//      Serper + учёт расхода (usage), поверх searchWeb.
++//
++// Механизмы НЕ изобретаем, а переиспользуем: usage — та же таблица/метод
++// db.recordUsage, что и для вызовов модели (kind="web_search" — отдельная статья
++// расхода); флаг включения — process.env (значение может приходить из server_config
++// через serverConfig.loadConfigIntoEnv, как и прочие фичефлаги). Нативный fetch,
++// без сторонних http-клиентов.
++// ─────────────────────────────────────────────────────────────────────────────
++
++const db = require("../db");
++
++const SERPER_URL = "https://google.serper.dev/search";
++const SEARCH_TIMEOUT_MS = 5000;
++const USAGE_KIND = "web_search";
++const USAGE_MODEL = "serper";
++
++/** Лимит частоты поиска per user (запросов в минуту). Дефолт разумный, env-override. */
++function ratePerMinute() {
++  const n = Number(process.env.WEB_SEARCH_RATE_PER_MIN);
++  return Number.isFinite(n) && n > 0 ? n : 10;
++}
++
++/** Нет ключа — понятная (отдельная) ошибка, чтобы вызывающий отличил её от
++ * пустого результата таймаута/не-200. */
++class MissingSerperKeyError extends Error {
++  constructor() {
++    super("SERPER_API_KEY не задан — веб-поиск невозможен");
++    this.name = "MissingSerperKeyError";
++  }
++}
++
++/**
++ * Чистый вызов Serper (сигнатура строго из ТЗ: searchWeb(query, { num = 5 })).
++ *  - нет ключа            → бросает MissingSerperKeyError (понятная ошибка);
++ *  - таймаут 5с / сеть     → [] + лог (чат из-за поиска не роняем);
++ *  - не-200 / не JSON      → [] + лог;
++ *  - успех                → нормализованный [{title, link, snippet, position}].
++ */
++async function searchWeb(query, { num = 5 } = {}) {
++  const key = process.env.SERPER_API_KEY;
++  if (!key) throw new MissingSerperKeyError();
++
++  const controller = new AbortController();
++  const timer = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
++  let res;
++  try {
++    res = await fetch(SERPER_URL, {
++      method: "POST",
++      headers: { "X-API-KEY": key, "Content-Type": "application/json" },
++      body: JSON.stringify({ q: query, num }),
++      signal: controller.signal,
++    });
++  } catch (e) {
++    // AbortError = таймаут 5с; прочее = сетевой сбой. И то и другое — пустой
++    // результат + лог, чтобы поиск не сорвал ответ модели.
++    console.log(`[webSearch] запрос не удался: ${e.name === "AbortError" ? "таймаут 5с" : e.message}`);
++    return [];
++  } finally {
++    clearTimeout(timer);
++  }
++
++  if (!res.ok) {
++    console.log(`[webSearch] Serper вернул ${res.status}`);
++    return [];
++  }
++
++  let data;
++  try {
++    data = await res.json();
++  } catch (e) {
++    console.log(`[webSearch] ответ Serper не JSON: ${e.message}`);
++    return [];
++  }
++
++  const organic = Array.isArray(data.organic) ? data.organic : [];
++  const results = organic.map((item, i) => ({
++    title: item.title ?? "",
++    link: item.link ?? "",
++    snippet: item.snippet ?? "",
++    position: typeof item.position === "number" ? item.position : i + 1,
++  }));
++
++  // POST-PROCESSING HOOK — результаты Serper готовы и нормализованы, но ещё НЕ
++  // отданы дальше. Сюда позже встанут фильтры / реранк / дедуп / кэш. Сейчас
++  // намеренно ничего не делаем — только зафиксированное место для расширения.
++
++  return results;
++}
++
++/**
++ * Эффективный тумблер веб-поиска для чата. Глобально — env WEB_SEARCH_ENABLED
++ * (значение может приходить из server_config через loadConfigIntoEnv — тот же
++ * механизм фичефлагов). Переопределение на чат — колонка chats."webSearchEnabled"
++ * (NULL = наследует глобальный; 1 = вкл; 0 = выкл). Нового механизма не заводим.
++ */
++function webSearchEnabledFor(chat) {
++  const globalOn = process.env.WEB_SEARCH_ENABLED === "1";
++  if (chat && chat.webSearchEnabled != null) return Number(chat.webSearchEnabled) === 1;
++  return globalOn;
++}
++
++/**
++ * Оркестратор поиска для плейн-чата: rate-limit (per user, окно 60с, ДО вызова
++ * Serper) → searchWeb → учёт расхода. Никогда не бросает — чат из-за поиска не
++ * падает. Возвращает { status, results, limit? }:
++ *   ok           — поиск выполнен (results заполнены/пусты);
++ *   rate_limited — превышен лимит частоты, Serper НЕ вызывался (limit = порог);
++ *   no_key       — SERPER_API_KEY не задан;
++ *   error        — иной сбой (залогирован).
++ * Расход пишем ТОЛЬКО когда Serper реально дёргали (kind="web_search",
++ * отдельная статья; токены 0/0 — поиск не съедает модельный токен-лимит, cost=1).
++ */
++async function runChatWebSearch({ userId, query, num = 5 }) {
++  // Rate limit ДО вызова Serper: считаем web_search-обращения за последние 60с.
++  const limit = ratePerMinute();
++  const since = Date.now() - 60_000;
++  const used = await db.countUsageSince(userId, USAGE_KIND, since);
++  if (used >= limit) {
++    return { status: "rate_limited", results: [], limit };
++  }
++
++  let results;
++  try {
++    results = await searchWeb(query, { num });
++  } catch (e) {
++    if (e instanceof MissingSerperKeyError) {
++      console.log(`[webSearch] ${e.message}`);
++      return { status: "no_key", results: [] };
++    }
++    console.log(`[webSearch] неожиданный сбой: ${e.message}`);
++    return { status: "error", results: [] };
++  }
++
++  // Каждый фактический вызов Serper — отдельная статья расхода. Токены 0/0,
++  // чтобы поиск НЕ шёл в модельный токен-лимит (usageLimits считает tokensIn+Out);
++  // cost=1 — «единица поиска» для учёта/тарификации.
++  await db.recordUsage({
++    userId,
++    kind: USAGE_KIND,
++    model: USAGE_MODEL,
++    tokensIn: 0,
++    tokensOut: 0,
++    cost: 1,
++  });
++
++  return { status: "ok", results };
++}
++
++/**
++ * Флаг webSearch для JAE (/chat/stream) при включённом слое 3. Глобус композера
++ * (askOpts.webSearch) включает встроенный поиск OpenRouter (":online" в
++ * apps/jae/model_choice.py). Если Serper уже дал результаты для этого ответа —
++ * ":online" не включаем: двойной поиск = двойная оплата и дубли в контексте.
++ * Во всех остальных случаях (Serper выключен, нет ключа, лимит, сбой, пусто) —
++ * глобус работает как раньше.
++ */
++function jaeWebSearchFlag(composerWebSearch, searchOutcome) {
++  const serperDelivered = !!searchOutcome && searchOutcome.status === "ok" && searchOutcome.results.length > 0;
++  return composerWebSearch === true && !serperDelivered;
++}
++
++/** Справочный блок для контекста модели: title + snippet + link по каждому. */
++function formatResultsForContext(results, max = 5) {
++  return results
++    .slice(0, max)
++    .map((r, i) => `${i + 1}. ${r.title}\n${r.snippet}\n${r.link}`)
++    .join("\n\n");
++}
++
++module.exports = {
++  searchWeb,
++  runChatWebSearch,
++  webSearchEnabledFor,
++  formatResultsForContext,
++  jaeWebSearchFlag,
++  MissingSerperKeyError,
++  USAGE_KIND,
++};
+diff --git a/scripts/web-search-selftest.js b/scripts/web-search-selftest.js
+new file mode 100644
+index 0000000..4296d4e
+--- /dev/null
++++ b/scripts/web-search-selftest.js
+@@ -0,0 +1,171 @@
++/**
++ * Self-test lib/webSearch.js — без сети и без БД (fetch и db замоканы).
++ * Запуск: node scripts/web-search-selftest.js
++ */
++const assert = require("assert");
++const path = require("path");
++
++// Заглушка db ДО require webSearch (он делает require("../db")).
++const dbPath = require.resolve("../db");
++const usageCalls = [];
++let usageCount = 0;
++require.cache[dbPath] = {
++  id: dbPath,
++  loaded: true,
++  exports: {
++    async countUsageSince() {
++      return usageCount;
++    },
++    async recordUsage(rec) {
++      usageCalls.push(rec);
++      return "id";
++    },
++  },
++};
++
++const webSearch = require("../lib/webSearch");
++
++let passed = 0;
++async function check(name, fn) {
++  await fn();
++  passed++;
++  console.log(`  ok  ${name}`);
++}
++
++function mockFetch(impl) {
++  global.fetch = impl;
++}
++function serperResponse(organic, { ok = true, status = 200 } = {}) {
++  return async () => ({
++    ok,
++    status,
++    async json() {
++      return { organic };
++    },
++    async text() {
++      return "";
++    },
++  });
++}
++
++async function main() {
++  // ── searchWeb: нормализация ────────────────────────────────────────────────
++  await check("searchWeb: нормализует organic -> {title,link,snippet,position}", async () => {
++    process.env.SERPER_API_KEY = "k";
++    mockFetch(
++      serperResponse([
++        { title: "A", link: "http://a", snippet: "sa", position: 1 },
++        { title: "B", link: "http://b", snippet: "sb" }, // без position -> idx+1
++      ])(),
++    );
++    // serperResponse возвращает промис объекта — обернём в функцию
++    mockFetch(serperResponse([
++      { title: "A", link: "http://a", snippet: "sa", position: 1 },
++      { title: "B", link: "http://b", snippet: "sb" },
++    ]));
++    const r = await webSearch.searchWeb("q", { num: 5 });
++    assert.deepStrictEqual(r, [
++      { title: "A", link: "http://a", snippet: "sa", position: 1 },
++      { title: "B", link: "http://b", snippet: "sb", position: 2 },
++    ]);
++  });
++
++  // ── searchWeb: нет ключа -> понятная ошибка (отдельный класс) ───────────────
++  await check("searchWeb: нет SERPER_API_KEY -> MissingSerperKeyError", async () => {
++    delete process.env.SERPER_API_KEY;
++    await assert.rejects(() => webSearch.searchWeb("q"), (e) => e instanceof webSearch.MissingSerperKeyError);
++  });
++
++  // ── searchWeb: non-200 -> пустой результат ──────────────────────────────────
++  await check("searchWeb: non-200 -> []", async () => {
++    process.env.SERPER_API_KEY = "k";
++    mockFetch(serperResponse([], { ok: false, status: 429 }));
++    assert.deepStrictEqual(await webSearch.searchWeb("q"), []);
++  });
++
++  // ── searchWeb: таймаут/сеть (fetch бросает AbortError) -> [] ────────────────
++  await check("searchWeb: сбой fetch (таймаут) -> []", async () => {
++    process.env.SERPER_API_KEY = "k";
++    mockFetch(async () => {
++      const e = new Error("aborted");
++      e.name = "AbortError";
++      throw e;
++    });
++    assert.deepStrictEqual(await webSearch.searchWeb("q"), []);
++  });
++
++  // ── runChatWebSearch: rate-limit ДО Serper (fetch НЕ зовётся, usage НЕ пишется)
++  await check("runChatWebSearch: превышен лимит -> rate_limited, Serper НЕ вызван", async () => {
++    process.env.SERPER_API_KEY = "k";
++    process.env.WEB_SEARCH_RATE_PER_MIN = "3";
++    usageCount = 3; // уже 3 за минуту
++    let fetched = false;
++    mockFetch(async () => {
++      fetched = true;
++      return { ok: true, status: 200, async json() { return { organic: [] }; } };
++    });
++    usageCalls.length = 0;
++    const s = await webSearch.runChatWebSearch({ userId: "u", query: "q" });
++    assert.strictEqual(s.status, "rate_limited");
++    assert.strictEqual(s.limit, 3);
++    assert.strictEqual(fetched, false, "Serper НЕ должен вызываться при превышении");
++    assert.strictEqual(usageCalls.length, 0, "usage не пишется, если Serper не звали");
++  });
++
++  // ── runChatWebSearch: ok -> Serper вызван, usage записан (kind web_search, 0 токенов)
++  await check("runChatWebSearch: ok -> usage записан отдельной статьёй, токены 0/0", async () => {
++    process.env.SERPER_API_KEY = "k";
++    process.env.WEB_SEARCH_RATE_PER_MIN = "10";
++    usageCount = 0;
++    usageCalls.length = 0;
++    mockFetch(serperResponse([{ title: "A", link: "http://a", snippet: "sa", position: 1 }]));
++    const s = await webSearch.runChatWebSearch({ userId: "u", query: "q" });
++    assert.strictEqual(s.status, "ok");
++    assert.strictEqual(s.results.length, 1);
++    assert.strictEqual(usageCalls.length, 1);
++    assert.strictEqual(usageCalls[0].kind, "web_search");
++    assert.strictEqual(usageCalls[0].tokensIn, 0);
++    assert.strictEqual(usageCalls[0].tokensOut, 0);
++  });
++
++  // ── runChatWebSearch: нет ключа -> no_key, чат не падает ─────────────────────
++  await check("runChatWebSearch: нет ключа -> no_key (не бросает)", async () => {
++    delete process.env.SERPER_API_KEY;
++    usageCount = 0;
++    const s = await webSearch.runChatWebSearch({ userId: "u", query: "q" });
++    assert.strictEqual(s.status, "no_key");
++    assert.deepStrictEqual(s.results, []);
++  });
++
++  // ── эффективный тумблер: глобальный env + per-chat override ──────────────────
++  await check("webSearchEnabledFor: глобальный env + per-chat override", async () => {
++    process.env.WEB_SEARCH_ENABLED = "1";
++    assert.strictEqual(webSearch.webSearchEnabledFor(null), true, "глобально вкл");
++    assert.strictEqual(webSearch.webSearchEnabledFor({ webSearchEnabled: 0 }), false, "чат выкл переопределяет");
++    process.env.WEB_SEARCH_ENABLED = "0";
++    assert.strictEqual(webSearch.webSearchEnabledFor(null), false, "глобально выкл");
++    assert.strictEqual(webSearch.webSearchEnabledFor({ webSearchEnabled: 1 }), true, "чат вкл переопределяет");
++    assert.strictEqual(webSearch.webSearchEnabledFor({ webSearchEnabled: null }), false, "null наследует глобальный");
++  });
++
++  // ── глобус композера (OpenRouter ":online") рядом с Serper ───────────────────
++  await check("jaeWebSearchFlag: глобус как раньше, кроме случая с результатами Serper", async () => {
++    const f = webSearch.jaeWebSearchFlag;
++    const hit = { status: "ok", results: [{ title: "t", link: "l", snippet: "s", position: 1 }] };
++    assert.strictEqual(f(true, null), true, "Serper выключен -> глобус работает");
++    assert.strictEqual(f(false, null), false, "глобус не нажат -> выкл");
++    assert.strictEqual(f(true, hit), false, "Serper дал результаты -> без двойного поиска");
++    assert.strictEqual(f(false, hit), false);
++    assert.strictEqual(f(true, { status: "ok", results: [] }), true, "Serper пусто -> фолбэк на глобус");
++    for (const status of ["rate_limited", "no_key", "error"]) {
++      assert.strictEqual(f(true, { status, results: [] }), true, `${status} -> фолбэк на глобус`);
++    }
++  });
++
++  console.log(`\n${passed} проверок пройдено.`);
++}
++
++main().catch((e) => {
++  console.error(e);
++  process.exit(1);
++});
+diff --git a/server.js b/server.js
+index fb7c3e0..331755f 100644
+--- a/server.js
++++ b/server.js
+@@ -25,6 +25,7 @@ const { issueSession, findOrCreateGoogleUser } = require("./lib/authSessions");
+ const githubState = require("./lib/githubState");
+ const githubAuth = require("./lib/githubAuth");
+ const { dispatch } = require("./lib/dispatcher");
++const webSearch = require("./lib/webSearch");
+ const dispatcherLearning = require("./lib/dispatcherLearning");
+ const { buildBrief } = require("./lib/brief");
+ const serverConfig = require("./lib/serverConfig");
+@@ -1111,23 +1112,53 @@ app.post("/api/agent/ask", async (req, res) => {
+       // Лимит — до вызова модели, не после.
+       await usageLimits.checkLimit(uid);
+ 
+-      // Чат привязан к проекту — brief собирается автоматически на каждый ход.
+-      // Без привязки — старое поведение: контекст только если проект упомянут /по-имени/.
+-      let context = null;
++      // Контекст модели = бриф проекта (как было) + справочный веб-блок (слой 3),
++      // если веб-поиск включён для этого чата. Собираем частями, чтобы веб-блок
++      // подмешивался в ЛЮБОМ плейн-чате — и с проектом, и без.
++      const contextParts = [];
++
++      // (1) Бриф проекта — как раньше.
++      let briefText = null;
+       if (chat.projectId) {
+         const project = await db.getProjectForUser(chat.projectId, uid);
+         if (project) {
+           const brief = await deps.buildBrief(uid, project.name);
+-          if (brief) context = `Проект ${brief.project}: ${brief.brief}`;
++          if (brief) briefText = `Проект ${brief.project}: ${brief.brief}`;
+         }
+       } else {
+         const projMatch = text.match(/\/([^/]+)\//);
+         if (projMatch) {
+           const brief = await deps.buildBrief(uid, projMatch[1].trim());
+-          if (brief) context = `Проект ${brief.project}: ${brief.brief}`;
++          if (brief) briefText = `Проект ${brief.project}: ${brief.brief}`;
++        }
++      }
++      if (briefText) contextParts.push(briefText);
++
++      // (2) ВЕБ-ПОИСК: перед ответом модели, если включён для чата. Rate-limit и
++      // учёт расхода — внутри runChatWebSearch (Serper не зовётся при превышении).
++      // Поиск НИКОГДА не роняет чат: любой сбой -> просто без веб-блока.
++      let searchOutcome = null;
++      if (webSearch.webSearchEnabledFor(chat)) {
++        const s = await webSearch.runChatWebSearch({ userId: uid, query: text, num: 5 });
++        searchOutcome = s;
++        if (s.status === "rate_limited") {
++          // Превышение лимита обрабатывается кодом: Serper не вызван, а модели
++          // даём понятную пометку, чтобы она честно сказала это пользователю.
++          contextParts.push(
++            `[Веб-поиск сейчас недоступен: превышен лимит ${s.limit} запросов в минуту. ` +
++              "Ответь из знаний модели и предложи повторить поиск чуть позже.]",
++          );
++        } else if (s.status === "ok" && s.results.length) {
++          contextParts.push(
++            "Справочные результаты веб-поиска (используй, если релевантно, и ссылайся на источники):\n" +
++              webSearch.formatResultsForContext(s.results, 5),
++          );
+         }
++        // no_key / error / пустой результат -> без веб-блока, чат продолжается.
+       }
+ 
++      const context = contextParts.length ? contextParts.join("\n\n") : null;
++
+       const r = await fetch(`${jaeUrl}/chat/stream`, {
+         method: "POST",
+         headers: {
+@@ -1143,7 +1174,9 @@ app.post("/api/agent/ask", async (req, res) => {
+           writeToChat: false,
+           // Выбор композера (lib/agentAskOptions.js). Старый JAE лишние поля игнорирует.
+           model: askOpts.model,
+-          webSearch: askOpts.webSearch,
++          // Глобус композера (":online" в JAE) — как раньше, кроме случая, когда
++          // Serper уже подмешал результаты (lib/webSearch.jaeWebSearchFlag).
++          webSearch: webSearch.jaeWebSearchFlag(askOpts.webSearch, searchOutcome),
+           images: askOpts.images.length ? askOpts.images.map((i) => i.dataUrl) : undefined,
+         }),
+       });
+@@ -2036,6 +2069,18 @@ app.delete("/api/chats/:chatId", async (req, res) => {
+   res.json({ ok: true });
+ });
+ 
++// Per-chat тумблер веб-поиска (слой 3). body: { enabled: true|false|null }
++// (null — наследовать глобальный env WEB_SEARCH_ENABLED). Только владелец чата.
++app.patch("/api/chats/:chatId/web-search", async (req, res) => {
++  const { enabled } = req.body || {};
++  if (!(enabled === true || enabled === false || enabled === null)) {
++    return res.status(400).json({ error: "enabled должен быть true, false или null" });
++  }
++  const chat = await db.setChatWebSearch(req.params.chatId, req.userId, enabled);
++  if (!chat) return res.status(404).json({ error: "chat not found" });
++  res.json({ ok: true, chatId: chat.id, webSearchEnabled: chat.webSearchEnabled });
++});
++
+ app.post("/api/chats/:chatId/messages", async (req, res) => {
+   const { content, meta } = req.body || {};
+   if (!content) return res.status(400).json({ error: "content обязателен" });
