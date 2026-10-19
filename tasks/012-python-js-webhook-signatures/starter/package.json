@@ -1,0 +1,6 @@
+{
+  "name": "webhooks",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test js/test/*.test.js && cd python && python -m unittest" }
+}
