@@ -1,0 +1,11 @@
+{
+  "name": "cursor-pagination",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "branch": "bash scripts/branch-and-commit.sh",
+    "pr": "bash scripts/open-pr.sh"
+  }
+}
