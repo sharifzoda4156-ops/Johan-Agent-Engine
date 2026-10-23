@@ -26,3 +26,126 @@
 Это **тестовый полигон**, не production-код Johan. Никаких production-интеграций, пользовательских данных и секретов. Реализацию задач агент готовит в отдельных ветках и PR; merge и deploy остаются за владельцем.
 
 **Статус:** опубликованы ТЗ 001–012. Прогоны агента на 008–012 не запускались.
+
+## Реализация задания № 001 — API фоновых заданий + worker
+
+Два отдельных процесса на одном хосте, общая SQLite-база (`better-sqlite3`, WAL):
+
+- **API** (`src/api.js`) — Fastify, принимает задания и отдаёт их состояние.
+- **worker** (`src/worker.js`) — забирает задания из очереди, считает слова, пишет результат.
+
+### Установка
+
+```bash
+npm install
+```
+
+Требуется Node.js 22+ (см. `engines.node` в `package.json`). `better-sqlite3` собирается
+нативно либо ставится из префилдов.
+
+### Запуск API
+
+```bash
+npm run start:api
+# эквивалент: node src/api.js
+```
+
+API слушает `PORT` (по умолчанию `3000`) на `HOST` (по умолчанию `0.0.0.0`).
+
+### Запуск worker
+
+```bash
+npm run start:worker
+# эквивалент: node src/worker.js
+```
+
+Worker опрашивает очередь каждые 50 мс (`POLL_INTERVAL_MS` в `src/worker.js`), берёт
+`queued`-задания и `running`-задания с истёкшим lease, обрабатывает их и сохраняет
+результат. API и worker можно запускать в любом порядке и в любом количестве — очередь
+сериализуется через SQLite.
+
+### Переменные окружения
+
+| Переменная       | По умолчанию          | Назначение                                             |
+| ---------------- | --------------------- | ------------------------------------------------------ |
+| `DATABASE_PATH`  | `./data/jobs.sqlite`  | Путь к общей SQLite-базе (каталог создаётся сам)       |
+| `PORT`           | `3000`                | Порт HTTP API                                          |
+| `HOST`           | `0.0.0.0`             | Адрес привязки HTTP API                                |
+
+Пример:
+
+```bash
+DATABASE_PATH=./data/jobs.sqlite PORT=3000 npm run start:api
+DATABASE_PATH=./data/jobs.sqlite npm run start:worker
+```
+
+### Тесты
+
+```bash
+npm test
+# эквивалент: node --test
+```
+
+Тесты используют временные файловые БД (`os.tmpdir()`), управляемые часы и реальные
+дочерние процессы для проверки graceful shutdown.
+
+### Примеры curl
+
+Создать задание (201 + `Location`):
+
+```bash
+curl -i -X POST http://localhost:3000/jobs \
+  -H 'content-type: application/json' \
+  -H 'idempotency-key: demo-1' \
+  -d '{"text":"hello world from the worker"}'
+```
+
+Повтор с тем же `idempotency-key` и тем же текстом вернёт 200 и то же задание; другой
+текст с тем же ключом — 409 `IDEMPOTENCY_CONFLICT`.
+
+Получить состояние задания:
+
+```bash
+curl -s http://localhost:3000/jobs/<id>
+# {"id":"...","state":"completed","result":{"wordCount":5},"attempts":1,"error":null}
+```
+
+Отменить задание (только пока оно `queued`):
+
+```bash
+curl -i -X POST http://localhost:3000/jobs/<id>/cancel
+# 200 {"id":"...","state":"cancelled",...}
+# 409 JOB_ALREADY_STARTED, если worker уже забрал задание
+# 409 JOB_TERMINAL, если задание завершено или упало
+```
+
+### Восстановление после рестарта worker
+
+Worker не хранит состояние в памяти: всё лежит в SQLite, поэтому рестарт безопасен.
+
+- Забранное задание получает `state='running'`, `claim_token` и `lease_until = now + 10s`.
+- Если worker упал, не успев записать результат, задание остаётся `running` с истёкшим
+  lease. После рестарта (или другой живой worker) `claimNext` подхватит его снова и
+  увеличит `attempts`.
+- Всего допускается 3 попытки (`attempts` 0..3). Когда истекает lease третьей попытки,
+  `expireLease` переводит задание в `failed` с `error='LEASE_EXPIRED'` — четвёртого
+  захвата не будет.
+- Постоянная ошибка обработки: задание возвращается в `queued` до исчерпания попыток,
+  затем переходит в `failed` с сохранённой причиной.
+
+Проверить вручную:
+
+```bash
+# 1. создать задание
+curl -s -X POST http://localhost:3000/jobs \
+  -H 'content-type: application/json' -d '{"text":"one two three"}'
+
+# 2. запустить worker, дождаться completed
+npm run start:worker
+
+# 3. убить worker (Ctrl-C / SIGTERM) и запустить снова — незавершённые running-задания
+#    с истёкшим lease будут подхвачены, attempts увеличится, результат допишется.
+```
+
+Graceful shutdown: и API, и worker по `SIGINT`/`SIGTERM` останавливают текущую работу,
+закрывают Fastify/цикл и корректно закрывают БД (WAL чекпоинтится), завершаясь с кодом 0.
